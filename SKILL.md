@@ -1,6 +1,6 @@
 ---
 name: video-subtitle
-description: 给任意视频加字幕的全流程——用 whisper.cpp 本地识别语音(自带逐句真实时间戳) → Claude 通读并纠正识别错误(同音字/专有名词) → 生成 SRT → 用带 libass 的 ffmpeg 把硬字幕烧录进视频。字号/字体/黑底白字均可定制，可复用于不同视频。当用户要"给视频加字幕""识别视频语音生成字幕""视频转字幕""字幕烧录/硬字幕/内嵌字幕""提取字幕""burn subtitles""video subtitle"时使用。
+description: 给任意视频加字幕的全流程——用 whisper.cpp 本地识别语音(自带逐句真实时间戳) → Claude 通读并纠正识别错误(同音字/专有名词) → 生成 SRT → 用带 libass 的 ffmpeg 把硬字幕烧录进视频。也支持把纯英文/外语视频自动翻译、配上「外语原文+中文」中外双语字幕(Claude 逐句翻译)。字号/字体/黑底白字/双语样式均可定制，可复用于不同视频。当用户要"给视频加字幕""识别视频语音生成字幕""视频转字幕""中英双语字幕/双语字幕""英文视频配中文字幕""字幕烧录/硬字幕/内嵌字幕""提取字幕""burn subtitles""bilingual subtitles""video subtitle"时使用。
 ---
 
 # 视频字幕全流程 (video-subtitle)
@@ -82,13 +82,52 @@ FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 ```
 字体：macOS 中文"系统字"PingFang SC 部分机器无文件，fontconfig 回退 `Hiragino Sans GB`（适合字幕）；`fc-match "PingFang SC"` 看实际字体。字号 1080p 上 28≈小/40≈中/48~52≈大。详见 [`references/burn-in-ffmpeg.md`](references/burn-in-ffmpeg.md)。
 
+## 双语字幕：外语视频 → 中外双语（纯英文配中英字幕等）
+
+把纯英文（或其它外语）视频做成「外语原文 + 中文翻译」双语硬字幕。在上面单语流程上做三处改动：
+
+1. **按源语言识别**（不是 `-l zh`）：英文用 `whisper-cli ... -l en`，得到带真实时间戳的英文逐句。
+2. **Claude 同时纠错 + 翻译**（核心，全自动，由你做）：通读英文转写，
+   - 纠正识别错误（专有名词、同音词；whisper 还常见**重复幻觉**——同一句连写多遍，可把那一小段音频单独 `-ss/-to` 切出来重识别还原）；
+   - **逐句译成自然中文**、术语统一；产出双语 `cues_bi.json`，每条含 `zh` / `en` / `start` / `end`（外文照抄纠错后的原文，中文是你的翻译）。
+   - 翻译同 `corrections` 一样是你的「逐视频工件」，**不需要用户提供**；把关键纠错/专名列给用户看（可否决）。
+
+### 双语字幕样式偏好（已固化为默认）
+- **中文在上(较大) + 外语原文在下(较小)**，同一条字幕分两行。
+- 字体 **`Hiragino Sans GB`**（macOS 中文字幕首选；PingFang SC 部分机器无字体文件，fontconfig 会回退到它）。
+- 两种样式：**`box` 白字 + 半透明黑底框**（醒目、对比最强，默认）；**`outline` 白字 + 黑描边**（干净不挡画面）。
+- **字号给真实像素、中文比外文大**。1080p 参考：中 46~54 / 英 32~38；要「大而醒目」就加大（如 1440p 用 中≈120 / 英≈50）。跨分辨率换算 `size ≈ 1080p值 ×(视频高/1080)`。
+
+### 先拆长句，再渲染、烧录（重要）
+字号一大，中文一行放不下就会折行、字幕糊成一坨。**先把过长的句子在标点处拆短**，保证每条中文 ≤1 行：
+```
+python3 scripts/split_long_cues.py --in cues_bi.json --out cues_bi_split.json \
+   --zh-size 120 --res 2560x1440 --margin-h 40
+#  必须用与下面 bi_ass.py 相同的 --zh-size/--res/--margin-h，阈值才和真实换行一致
+#  自动按标点断句、外文按比例断词、时间按中文长度切分；个别想更自然的断点可手改结果 json
+```
+再生成双语 ASS 并烧录（烧录命令同单语流程，`-vf "ass=bi.ass"`）：
+```
+python3 scripts/bi_ass.py --cues cues_bi_split.json --out bi.ass \
+   --style box --zh-size 120 --en-size 50 --res 2560x1440 --box-alpha 40 --margin-h 40
+#  box-alpha 数值越小底框越深(40≈75%不透明)；outline 样式改用 --outline 调描边宽度
+```
+**烧整段前必抽帧确认**（短句、长句各抽一帧）。注意：抽帧（及任何按时间点取画面）要用 **`-copyts` 且 `-ss` 放 `-i` 之前**，否则字幕 filter 把帧当 t=0、永远只渲染第一条：
+```
+FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
+"$FF" -loglevel error -copyts -ss <秒> -i video.mp4 -vf "ass=bi.ass" -frames:v 1 -y sample.png
+```
+最后可从 `cues_bi_split.json` 导出一份中外双语 `.srt`（每条两行：中文 / 原文）作为附带产物。
+
 ## 脚本一览
 | 脚本 | 作用 |
 |---|---|
 | `scripts/srt_to_cues.py` | SRT（whisper 输出）→ 统一 cues.json，**可同时应用纠错表/纠错项**，并写出纠错后 SRT |
 | `scripts/cues_to_srt.py` | cues.json → SRT（核对页改完后导出成片用 SRT） |
 | `scripts/make_review_html.py` | 交互式核对页（文字+时间轴可改、播放跟随、导出 SRT） |
-| `scripts/srt_to_ass.py` | cues.json → ASS（字号/字体/黑底白字 or 描边/分辨率，字号=真实像素） |
+| `scripts/srt_to_ass.py` | cues.json → ASS（**单语**：字号/字体/黑底白字 or 描边/分辨率，字号=真实像素） |
+| `scripts/bi_ass.py` | 双语 cues → ASS（**中外双语**：中文在上较大、外文在下较小；box 半透明底框 or 描边；字号=真实像素） |
+| `scripts/split_long_cues.py` | 双语 cues 长句拆短，保证每条中文 ≤1 行（标点断句、时间按比例切分） |
 
 ## 泛化到不同视频（重要）
 - **用户唯一要给的就是视频**（外加可选样式偏好）。其余全自动：`--res`/`--duration` 用 ffprobe 探测；`--prompt` 留空或你自行判断；**`corrections.txt` 由你通读该视频转写后自动生成**——这些都不要求用户提供。
