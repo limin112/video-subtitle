@@ -47,6 +47,7 @@ whisper-cli -m "$M" -f audio16k.wav -l zh -osrt -of video_whisper -t 8
 - `-l zh` 中文（其它语言改对应代码）；`-t 8` 线程。7 分钟视频约 30 秒。
 - **不要加 `-ml`**：默认按自然停顿断句，行干净（短句一行各带时间戳）；`-ml N` 会按字数硬切、断在词中间，慎用。
 - `--prompt` **可选、且由你判断**（不要让用户给）：若你从画面/上下文已能确定专有名词，可加 `--prompt "Codex、AI First"` 提升首轮准确率；否则留空，反正第 3 步会纠。
+- **开场/结尾有音乐·掌声时加 VAD**：whisper 会幻觉出字幕（如反复 “We'll be right back”）并把随后人声的时间戳往前压（**字幕偏早**）。加 `--vad -vm ~/.cache/whisper.cpp/ggml-silero-v5.1.2.bin`（模型 ~864KB，外联需同意）对齐真实语音、跳过非语音。VAD 可能漏掉极短句（如 “Hello”）——诊断、细粒度 VAD 与「只改开场不重译」详见 [`references/transcribe-whisper.md`](references/transcribe-whisper.md)。
 - 详见 [`references/transcribe-whisper.md`](references/transcribe-whisper.md)。
 
 ### 3. Claude 纠错（关键，全自动，由你做）
@@ -90,6 +91,7 @@ FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 2. **Claude 同时纠错 + 翻译**（核心，全自动，由你做）：通读英文转写，
    - 纠正识别错误（专有名词、同音词；whisper 还常见**重复幻觉**——同一句连写多遍，可把那一小段音频单独 `-ss/-to` 切出来重识别还原）；
    - **逐句译成自然中文**、术语统一；产出双语 `cues_bi.json`，每条含 `zh` / `en` / `start` / `end`（外文照抄纠错后的原文，中文是你的翻译）。
+   - **别手写 `cues_bi.json`**：条数多、易错、改一条还要对齐时间。用「构建脚本」按 `idx` 从 `cues_en.json` 合并——`CORR`(英文纠错) + `ZH`(逐条译文) + `TIME_OVERRIDE`(改个别条时间) + `DROP`(删幻觉条)。可复现、改时间/删条不必重译。模板见 [`references/bilingual-build-workflow.md`](references/bilingual-build-workflow.md)。
    - 翻译同 `corrections` 一样是你的「逐视频工件」，**不需要用户提供**；把关键纠错/专名列给用户看（可否决）。
 
 ### 双语字幕样式偏好（已固化为默认）
@@ -99,12 +101,13 @@ FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 - **字号给真实像素、中文比外文大**。1080p 参考：中 46~54 / 英 32~38；要「大而醒目」就加大（如 1440p 用 中≈120 / 英≈50）。跨分辨率换算 `size ≈ 1080p值 ×(视频高/1080)`。
 
 ### 先拆长句，再渲染、烧录（重要）
-字号一大，中文一行放不下就会折行、字幕糊成一坨。**先把过长的句子在标点处拆短**，保证每条中文 ≤1 行：
+字号一大，一行放不下就会折行、字幕糊成一坨。**中文和外文都要约束**——只看中文的旧 `split_long_cues.py` 会让外文行在大字号下偷偷折成两行。用 `split_bi_cues.py`（中英都顾）：
 ```
-python3 scripts/split_long_cues.py --in cues_bi.json --out cues_bi_split.json \
-   --zh-size 120 --res 2560x1440 --margin-h 40
-#  必须用与下面 bi_ass.py 相同的 --zh-size/--res/--margin-h，阈值才和真实换行一致
-#  自动按标点断句、外文按比例断词、时间按中文长度切分；个别想更自然的断点可手改结果 json
+python3 scripts/split_bi_cues.py --in cues_bi.json --out cues_bi_split.json \
+   --zh-size 120 --en-size 50 --res 2560x1440 --margin-h 40
+#  必须用与下面 bi_ass.py 相同的 --zh-size/--en-size/--res/--margin-h，阈值才和真实换行一致
+#  中文 OR 外文任一行超宽就继续拆；保护 token 不被从中间断开(CLAUDE.md、HTTP/3、4.7 等)；超宽必拆到底
+#  运行末尾打印「仍超宽: N」，正常应为 0；个别想更自然的断点可手改结果 json
 ```
 再生成双语 ASS 并烧录（烧录命令同单语流程，`-vf "ass=bi.ass"`）：
 ```
@@ -127,7 +130,8 @@ FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 | `scripts/make_review_html.py` | 交互式核对页（文字+时间轴可改、播放跟随、导出 SRT） |
 | `scripts/srt_to_ass.py` | cues.json → ASS（**单语**：字号/字体/黑底白字 or 描边/分辨率，字号=真实像素） |
 | `scripts/bi_ass.py` | 双语 cues → ASS（**中外双语**：中文在上较大、外文在下较小；box 半透明底框 or 描边；字号=真实像素） |
-| `scripts/split_long_cues.py` | 双语 cues 长句拆短，保证每条中文 ≤1 行（标点断句、时间按比例切分） |
+| `scripts/split_bi_cues.py` | **双语拆行（推荐）**：中文 **和** 外文任一行超宽都拆，保证两行各 ≤1 行不折；token 保护、超宽必拆到底 |
+| `scripts/split_long_cues.py` | 旧版长句拆短（**只看中文宽度**）；双语场景请改用 `split_bi_cues.py` |
 
 ## 泛化到不同视频（重要）
 - **用户唯一要给的就是视频**（外加可选样式偏好）。其余全自动：`--res`/`--duration` 用 ffprobe 探测；`--prompt` 留空或你自行判断；**`corrections.txt` 由你通读该视频转写后自动生成**——这些都不要求用户提供。
@@ -139,3 +143,5 @@ FF=/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg
 - 原始视频不要动，用软链接 `video.mp4` 引用。
 - 识别/烧录较耗时，适合后台跑，完成再汇报。
 - 下载模型属外联操作，先征得用户同意。
+- **开场/结尾有音乐·掌声**：whisper 易幻觉出字幕、并把人声计时往前压（字幕偏早）→ 用 VAD 重识别，并把幻觉条 `DROP`、偏差条填 `TIME_OVERRIDE`（见 [`references/transcribe-whisper.md`](references/transcribe-whisper.md) / [`references/bilingual-build-workflow.md`](references/bilingual-build-workflow.md)）。
+- **双语拆行用 `split_bi_cues.py`**（中英都顾），别用只看中文的 `split_long_cues.py`；烧整段前抽帧**专挑最长的句子**确认外文行不折。
